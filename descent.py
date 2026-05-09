@@ -50,8 +50,8 @@ class PiperRobotTrainer:
 
         self.work_dir = Path.cwd()
 
-        self.IMG_HEIGHT = 128
-        self.IMG_WIDTH = 128
+        self.IMG_HEIGHT = 84
+        self.IMG_WIDTH = 84
         self.frame_stack = 3
         self.batch_size = 256
         self.update_every_episodes = 5
@@ -115,9 +115,14 @@ class PiperRobotTrainer:
 
         # 3D鼠标
         self.DEAD_ZONE = 0.15
-        self.SPACE_MOUSE_ACTION_SCALE = 1.0
+        self.SPACE_MOUSE_ACTION_SCALE = 2.0
         self.spacemouse_reader = None
         self.is_intervening = False
+
+        # Staged reward
+        self.STAGE_REWARDS = {1: 1.0, 2: 3.0, 3: 6.0}
+        self.STAGE_NAMES = {0: "none", 1: "reached", 2: "grasped", 3: "lifted"}
+        self.current_stage = 0
 
         # 夹爪
         self.random_gripper_state = 1.0
@@ -517,20 +522,73 @@ class PiperRobotTrainer:
                    cv2.FONT_HERSHEY_SIMPLEX, font_body, (255, 255, 255), thick)
         y_pos += line_spacing
 
-        cv2.putText(frame_bgr, "SPACE=+10 s=Save q=Quit", (10, y_pos),
+        cv2.putText(frame_bgr, "1=reached 2=grasped 3=lifted s=Save q=Quit", (10, y_pos),
                    cv2.FONT_HERSHEY_SIMPLEX, font_small, (0, 200, 255), thin)
 
         cv2.imshow("Piper Robot Training", frame_bgr)
 
         key = cv2.waitKey(1) & 0xFF
-        if key == ord(' '):
-            self._reward += 10.0
+        if key == ord('1') and self.current_stage < 1:
+            self.current_stage = 1
+            self._reward += self.STAGE_REWARDS[1]
+        elif key == ord('2') and self.current_stage < 2:
+            self.current_stage = 2
+            self._reward += self.STAGE_REWARDS[2]
+        elif key == ord('3') and self.current_stage < 3:
+            self.current_stage = 3
+            self._reward += self.STAGE_REWARDS[3]
         elif key == ord('s'):
             self.save_snapshot()
         elif key == ord('q'):
             return False
 
         return True
+
+    def pretrain_bc(self, bc_steps=10000, bc_loss_type='mse', log_interval=500):
+        """BC pretraining on demo data before RL.
+
+        Only updates encoder + actor. Must be called after agent init
+        and before train().
+        """
+        if self.agent is None:
+            print("[BC] WARNING: Agent not initialized, skipping BC pretraining")
+            return
+
+        # Check buffer has data
+        npz_files = list(self._buffer_dir.glob('*.npz'))
+        if len(npz_files) == 0:
+            print('[BC] WARNING: No demo data in buffer, skipping BC pretraining')
+            return
+
+        buffer_size = len(self.replay_storage)
+        print(f"\n{'='*60}")
+        print(f"  BC Pretraining: {bc_steps} steps, loss_type={bc_loss_type}")
+        print(f"  Demo buffer: {buffer_size} transitions, {len(npz_files)} episodes")
+        print(f"{'='*60}")
+
+        # Ensure replay_iter is ready
+        if self.replay_iter is None:
+            self.replay_iter = iter(self.replay_loader)
+
+        # Force fetch buffer data
+        if hasattr(self, '_replay_buffer') and self._replay_buffer is not None:
+            self._replay_buffer._samples_since_last_fetch = self._replay_buffer._fetch_every
+
+        for bc_step in range(1, bc_steps + 1):
+            try:
+                metrics = self.agent.update_bc(self.replay_iter, bc_loss_type)
+            except Exception as e:
+                print(f"[BC] step {bc_step} error: {e}")
+                break
+
+            if bc_step % log_interval == 0 or bc_step == 1:
+                print(f"[BC] step {bc_step}/{bc_steps} | "
+                      f"bc_loss={metrics.get('bc_loss', 0):.4f} | "
+                      f"action_error={metrics.get('bc_action_error', 0):.4f}")
+
+        # Save BC pretrained snapshot
+        self.save_snapshot()
+        print(f"[BC] Pretraining done.\n")
 
     def train(self, num_episodes=100, max_steps_per_episode=200):
         print("\n开始训练...")
@@ -543,6 +601,7 @@ class PiperRobotTrainer:
                 self._global_episode = episode
                 self.episode_step = 0
                 self.episode_reward = 0.0
+                self.current_stage = 0
 
                 # 复位
                 self.X, self.Y, self.Z = self.HOME_X, self.HOME_Y, self.HOME_Z
@@ -626,6 +685,10 @@ class PiperRobotTrainer:
                         print("\n用户退出训练")
                         return
 
+                    # 按3(提起)后提前结束episode
+                    if self.current_stage >= 3:
+                        break
+
                 step_bar.close()
 
                 # Episode结束
@@ -691,6 +754,8 @@ def main():
     parser.add_argument('--snapshot', type=str, default=None, help='预训练权重路径')
     parser.add_argument('--episodes', type=int, default=1000, help='训练 episode 数量')
     parser.add_argument('--steps', type=int, default=1500, help='每个 episode 最大步数')
+    parser.add_argument('--bc_steps', type=int, default=10000, help='BC预训练步数 (0=不预训练)')
+    parser.add_argument('--bc_loss', type=str, default='mse', choices=['mse', 'nll'], help='BC损失类型')
 
     args = parser.parse_args()
 
@@ -740,6 +805,10 @@ def main():
 
     if args.snapshot:
         trainer.load_snapshot(args.snapshot)
+
+    # BC pretraining on demo data
+    if args.bc_steps > 0:
+        trainer.pretrain_bc(bc_steps=args.bc_steps, bc_loss_type=args.bc_loss)
 
     trainer.train(num_episodes=args.episodes, max_steps_per_episode=args.steps)
 
