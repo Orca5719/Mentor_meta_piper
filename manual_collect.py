@@ -356,14 +356,14 @@ class SimpleSpacemouseCollect:
                 if self._latest_frame is not None:
                     display = cv2.cvtColor(self._latest_frame, cv2.COLOR_RGB2BGR)
                     cv2.putText(display, f"Ep:{self.episode+1}/{num_episodes} Step:{self.episode_step}/{max_steps}",
-                               (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                    cv2.putText(display, f"Buffer: {len(self.replay_storage)}",
-                               (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
-                    cv2.putText(display, f"Stage: {self.STAGE_NAMES[self.current_stage]}",
-                               (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 200, 0), 2)
+                               (5, 12), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 0), 1)
+                    cv2.putText(display, f"Buf:{len(self.replay_storage)}",
+                               (5, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 0), 1)
+                    cv2.putText(display, f"Stage:{self.STAGE_NAMES[self.current_stage]}",
+                               (5, 36), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 200, 0), 1)
                     if is_intervening:
-                        cv2.putText(display, "INTERVENING", (10, 150),
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                        cv2.putText(display, "INTV", (5, 48),
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 255), 1)
                     cv2.imshow("Data Collection", display)
 
                 key = cv2.waitKey(1) & 0xFF
@@ -447,6 +447,10 @@ class SimpleSpacemouseCollect:
 
         except KeyboardInterrupt:
             print("\n用户中断收集")
+        except Exception as e:
+            import traceback
+            print(f"\n❌ 收集过程出错: {e}")
+            traceback.print_exc()
         finally:
             self._running = False
             time.sleep(0.3)
@@ -457,9 +461,13 @@ class SimpleSpacemouseCollect:
                 print("✅ 3D鼠标已停止")
 
             if self.piper_arm is not None:
-                self.piper_arm.emergency_stop()
-                self.piper_arm.disable()
-                print("✅ 机械臂已断开")
+                self.piper_arm.move_to_pose(
+                    self.HOME_X, self.HOME_Y, self.HOME_Z,
+                    self.HOME_RX, self.HOME_RY, self.HOME_RZ,
+                    speed=50
+                )
+                self.piper_arm.set_gripper(0.08)
+                print("✅ 机械臂已回零位")
 
             if self.camera is not None:
                 self.camera.disconnect()
