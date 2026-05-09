@@ -40,16 +40,27 @@ except ImportError:
 
 
 class KeyboardRewardListener:
-    """Background thread that listens for spacebar press to give manual reward.
+    """Background thread that listens for staged manual reward.
 
-    Press SPACE → reward +10 and success = True for the current step.
-    Press Q     → emergency stop.
+    Staged reward scheme:
+      Key 1 → "到达" (reached):  reward +1.0,  stage=1
+      Key 2 → "抓住" (grasped):  reward +3.0,  stage=2
+      Key 3 → "提起" (lifted):   reward +6.0,  stage=3, success=True
+      Key Q → emergency stop
+
+    Total max reward per episode = 1.0 + 3.0 + 6.0 = 10.0.
+    Stages are progressive: pressing a later key implicitly advances the stage.
     """
+
+    # Staged reward constants
+    STAGE_REWARDS = {1: 1.0, 2: 3.0, 3: 6.0}
+    STAGE_NAMES = {0: "none", 1: "reached", 2: "grasped", 3: "lifted"}
 
     def __init__(self):
         self._reward_pending = 0.0
         self._success_pending = False
         self._estop = False
+        self._current_stage = 0  # tracks highest stage achieved this episode
         self._lock = threading.Lock()
         self._running = False
         self._thread = None
@@ -59,13 +70,24 @@ class KeyboardRewardListener:
         self._running = True
         self._thread = threading.Thread(target=self._listen_loop, daemon=True)
         self._thread.start()
-        print("[KeyboardReward] Listener started. Press SPACE for reward+10, Q for e-stop.")
+        print("[KeyboardReward] Listener started. "
+              "1=reached(+1), 2=grasped(+3), 3=lifted(+6), Q=e-stop")
 
     def stop(self):
         """Stop the keyboard listener."""
         self._running = False
         if self._thread is not None:
             self._thread.join(timeout=1.0)
+
+    def reset_stage(self):
+        """Reset stage tracking for a new episode."""
+        with self._lock:
+            self._current_stage = 0
+
+    @property
+    def current_stage(self):
+        with self._lock:
+            return self._current_stage
 
     def consume(self):
         """Consume pending reward and success, then reset them.
@@ -82,10 +104,18 @@ class KeyboardRewardListener:
             self._success_pending = False
         return reward, success, estop
 
-    def _set_reward(self, reward, success):
+    def _advance_stage(self, stage):
+        """Advance to the given stage if not already reached."""
         with self._lock:
+            if stage <= self._current_stage:
+                return  # already reached this or a higher stage
+            self._current_stage = stage
+            reward = self.STAGE_REWARDS[stage]
             self._reward_pending += reward
+            success = (stage == 3)
             self._success_pending = self._success_pending or success
+            print(f"[KeyboardReward] Stage {stage}: {self.STAGE_NAMES[stage]} | +{reward:.1f}"
+                  + (" ★ SUCCESS!" if success else ""))
 
     def _set_estop(self):
         with self._lock:
@@ -105,9 +135,12 @@ class KeyboardRewardListener:
             try:
                 if msvcrt.kbhit():
                     ch = msvcrt.getch()
-                    if ch == b' ':
-                        self._set_reward(10.0, True)
-                        print("[KeyboardReward] ★ Reward +10, SUCCESS!")
+                    if ch == b'1':
+                        self._advance_stage(1)
+                    elif ch == b'2':
+                        self._advance_stage(2)
+                    elif ch == b'3':
+                        self._advance_stage(3)
                     elif ch.lower() == b'q':
                         self._set_estop()
                         print("[KeyboardReward] *** E-STOP triggered ***")
@@ -123,9 +156,12 @@ class KeyboardRewardListener:
             while self._running:
                 if select.select([sys.stdin], [], [], 0.01)[0]:
                     ch = sys.stdin.read(1)
-                    if ch == ' ':
-                        self._set_reward(10.0, True)
-                        print("[KeyboardReward] ★ Reward +10, SUCCESS!")
+                    if ch == '1':
+                        self._advance_stage(1)
+                    elif ch == '2':
+                        self._advance_stage(2)
+                    elif ch == '3':
+                        self._advance_stage(3)
                     elif ch.lower() == 'q':
                         self._set_estop()
                         print("[KeyboardReward] *** E-STOP triggered ***")
@@ -356,7 +392,7 @@ class PiperEnv:
         self._go_home()
 
     def _go_home(self):
-        """Move robot to home pose."""
+        """Move robot to home pose and reset reward stage."""
         pose = self._home_pose
         self._robot.move_to_pose(
             pose[0], pose[1], pose[2],
@@ -366,6 +402,9 @@ class PiperEnv:
         time.sleep(1.0)
         self._robot.set_gripper(0.0)
         self._step_count = 0
+        # Reset staged reward for new episode
+        if self._keyboard is not None:
+            self._keyboard.reset_stage()
 
     def _clip_to_workspace(self, x, y, z):
         """Clip end-effector position to workspace bounds."""
@@ -406,7 +445,8 @@ class PiperEnv:
             action: dict with key 'action', value is np.array of shape (4,)
                     [dx, dy, dz, gripper] all in [-1, 1]
 
-        Reward and success are provided by the human operator pressing SPACE.
+        Reward and success are provided by the human operator:
+          Key 1 = reached (+1.0), Key 2 = grasped (+3.0), Key 3 = lifted (+6.0).
         """
         action = action["action"]
         assert action.shape == (4,), f"Expected action shape (4,), got {action.shape}"
