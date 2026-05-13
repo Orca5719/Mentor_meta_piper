@@ -29,6 +29,15 @@ def load_episode(fn):
         return episode
 
 
+def _episode_demo_ratio(episode):
+    """Compute intervention ratio for an episode (0.0 = pure RL, 1.0 = pure demo)."""
+    is_int = episode.get('is_intervened', None)
+    if is_int is None:
+        return 0.0
+    # skip the dummy first transition (index 0)
+    return float(is_int[1:].mean())
+
+
 class ReplayBufferStorage:
     def __init__(self, data_specs, replay_dir):
         self._data_specs = data_specs
@@ -75,22 +84,73 @@ class ReplayBufferStorage:
 
 class ReplayBuffer(IterableDataset):
     def __init__(self, replay_dir, max_size, num_workers, nstep, discount,
-                 fetch_every, save_snapshot):
+                 fetch_every, save_snapshot,
+                 demo_ratio_start=1.0, demo_ratio_end=0.3, demo_ratio_decay_steps=50000):
         self._replay_dir = replay_dir
         self._size = 0
         self._max_size = max_size
         self._num_workers = max(1, num_workers)
         self._episode_fns = []
         self._episodes = dict()
+        self._episode_demo_ratios = dict()  # eps_fn -> demo_ratio
         self._nstep = nstep
         self._discount = discount
         self._fetch_every = fetch_every
         self._samples_since_last_fetch = fetch_every
         self._save_snapshot = save_snapshot
 
+        # Demo优先采样参数
+        self._demo_ratio_start = demo_ratio_start
+        self._demo_ratio_end = demo_ratio_end
+        self._demo_ratio_decay_steps = demo_ratio_decay_steps
+        self._total_samples = 0
+
+    def _compute_demo_ratio(self):
+        """Compute current demo sampling ratio based on decay schedule."""
+        if self._demo_ratio_decay_steps <= 0:
+            return self._demo_ratio_end
+        t = min(1.0, self._total_samples / self._demo_ratio_decay_steps)
+        return self._demo_ratio_start + (self._demo_ratio_end - self._demo_ratio_start) * t
+
+    def _is_demo_episode(self, eps_fn):
+        """Check if an episode is a demo episode (intervention ratio > 0.3)."""
+        ratio = self._episode_demo_ratios.get(eps_fn, 0.0)
+        return ratio > 0.3
+
     def _sample_episode(self):
-        eps_fn = random.choice(self._episode_fns)
-        return self._episodes[eps_fn]
+        if len(self._episode_fns) == 0:
+            return None
+
+        current_demo_ratio = self._compute_demo_ratio()
+
+        # Separate demo and non-demo episodes
+        demo_fns = []
+        rl_fns = []
+        for fn in self._episode_fns:
+            if self._is_demo_episode(fn):
+                demo_fns.append(fn)
+            else:
+                rl_fns.append(fn)
+
+        # If only one type available, sample from it
+        if not demo_fns:
+            eps_fn = random.choice(self._episode_fns)
+            return self._episodes[eps_fn]
+        if not rl_fns:
+            eps_fn = random.choice(self._episode_fns)
+            return self._episodes[eps_fn]
+
+        # Decide whether to sample from demo or RL pool
+        if random.random() < current_demo_ratio:
+            # Sample from demo episodes, weighted by intervention ratio
+            weights = np.array([self._episode_demo_ratios[fn] for fn in demo_fns])
+            weights = weights / weights.sum()
+            idx = np.random.choice(len(demo_fns), p=weights)
+            return self._episodes[demo_fns[idx]]
+        else:
+            # Sample uniformly from RL episodes
+            eps_fn = random.choice(rl_fns)
+            return self._episodes[eps_fn]
 
     def _store_episode(self, eps_fn):
         try:
@@ -98,11 +158,21 @@ class ReplayBuffer(IterableDataset):
         except:
             return False
         eps_len = episode_len(episode)
+
+        # Track demo ratio for this episode
+        self._episode_demo_ratios[eps_fn] = _episode_demo_ratio(episode)
+
         while eps_len + self._size > self._max_size:
-            early_eps_fn = self._episode_fns.pop(0)
-            early_eps = self._episodes.pop(early_eps_fn)
-            self._size -= episode_len(early_eps)
-            early_eps_fn.unlink(missing_ok=True)
+            # Find the best candidate to evict: prefer non-demo episodes, then oldest
+            evict_idx = self._find_evict_candidate()
+            if evict_idx is None:
+                break
+            evict_fn = self._episode_fns.pop(evict_idx)
+            evict_eps = self._episodes.pop(evict_fn)
+            self._episode_demo_ratios.pop(evict_fn, None)
+            self._size -= episode_len(evict_eps)
+            evict_fn.unlink(missing_ok=True)
+
         self._episode_fns.append(eps_fn)
         self._episode_fns.sort()
         self._episodes[eps_fn] = episode
@@ -111,6 +181,15 @@ class ReplayBuffer(IterableDataset):
         if not self._save_snapshot:
             eps_fn.unlink(missing_ok=True)
         return True
+
+    def _find_evict_candidate(self):
+        """Find the best episode to evict: prefer non-demo, then oldest."""
+        # First try to find a non-demo episode
+        for i, fn in enumerate(self._episode_fns):
+            if not self._is_demo_episode(fn):
+                return i
+        # All are demo episodes — evict the oldest (index 0)
+        return 0 if self._episode_fns else None
 
     def _try_fetch(self):
         if self._samples_since_last_fetch < self._fetch_every:
@@ -140,7 +219,10 @@ class ReplayBuffer(IterableDataset):
         except:
             traceback.print_exc()
         self._samples_since_last_fetch += 1
+        self._total_samples += 1
         episode = self._sample_episode()
+        if episode is None:
+            return None
         # add +1 for the first dummy transition
         idx = np.random.randint(0, episode_len(episode) - self._nstep + 1) + 1
         obs = episode['observation'][idx - 1]
@@ -168,13 +250,14 @@ class ReplayBuffer(IterableDataset):
 
 
 def _worker_init_fn(worker_id):
-    seed = np.random.get_state()[1][0] + worker_id
+    seed = int(np.random.get_state()[1][0]) + worker_id
     np.random.seed(seed)
     random.seed(seed)
 
 
 def make_replay_loader(replay_dir, max_size, batch_size, num_workers,
-                       save_snapshot, nstep, discount):
+                       save_snapshot, nstep, discount,
+                       demo_ratio_start=1.0, demo_ratio_end=0.3, demo_ratio_decay_steps=50000):
     max_size_per_worker = max_size // max(1, num_workers)
 
     iterable = ReplayBuffer(replay_dir,
@@ -183,7 +266,10 @@ def make_replay_loader(replay_dir, max_size, batch_size, num_workers,
                             nstep,
                             discount,
                             fetch_every=1000,
-                            save_snapshot=save_snapshot)
+                            save_snapshot=save_snapshot,
+                            demo_ratio_start=demo_ratio_start,
+                            demo_ratio_end=demo_ratio_end,
+                            demo_ratio_decay_steps=demo_ratio_decay_steps)
 
     loader = torch.utils.data.DataLoader(iterable,
                                          batch_size=batch_size,
